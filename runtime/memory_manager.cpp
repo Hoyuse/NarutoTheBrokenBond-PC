@@ -49,6 +49,7 @@ bool MemoryManager::Initialize() {
 
     // Pre-initialize ProcessType at offset 379 (0x17B) of default heap (1 = Title Process)
     *(m_base + 0x10000000 + 379) = 1;
+    *(m_base + 0x50000000 + 379) = 1;
 
     return true;
 }
@@ -132,9 +133,9 @@ void MemoryManager::InitializeLookupTable() {
 
     std::cout << "[MemoryManager] Initializing indirect function lookup table with safe dispatch..." << std::endl;
 
-    // Fill table with safe fallback to catch unmapped indirect calls
+    uint8_t* tableStart = m_base + PPC_IMAGE_BASE + PPC_IMAGE_SIZE;
     size_t tableSlots = (PPC_CODE_SIZE * 2) / sizeof(PPCFunc*);
-    PPCFunc** tableBase = reinterpret_cast<PPCFunc**>(m_base + PPC_IMAGE_BASE + PPC_IMAGE_SIZE);
+    PPCFunc** tableBase = reinterpret_cast<PPCFunc**>(tableStart);
     std::fill_n(tableBase, tableSlots, &SafeIndirectPPCFunc);
 
     size_t count = 0;

@@ -42,8 +42,8 @@ private:
     size_t m_entryPoint{ 0 };
 
     uint32_t m_stackTop{ 0x70000000 };
-    uint32_t m_heapCurrent{ 0x10000000 };
-    uint32_t m_heapLimit{ 0x3F000000 };
+    uint32_t m_heapCurrent{ 0x50000000 };
+    uint32_t m_heapLimit{ 0x6E000000 };
 
     std::mutex m_allocMutex;
     std::unordered_map<uint32_t, size_t> m_allocations;

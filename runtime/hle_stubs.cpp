@@ -10,15 +10,41 @@
 #include <algorithm>
 #include <atomic>
 #include <memory>
+#include <condition_variable>
 
 namespace {
     bool g_verboseHle = false;
     std::mutex g_csMutex;
     std::unordered_map<uint32_t, std::unique_ptr<std::recursive_mutex>> g_criticalSections;
 
+    // Event emulation subsystem
+    struct GuestEvent {
+        std::mutex mtx;
+        std::condition_variable cv;
+        bool manualReset{ false };
+        bool signaled{ false };
+    };
+
+    std::mutex g_eventMutex;
+    std::unordered_map<uint32_t, std::shared_ptr<GuestEvent>> g_events;
+
+    std::shared_ptr<GuestEvent> GetOrCreateEvent(uint32_t id, bool manualReset = false, bool initialSignaled = false) {
+        std::lock_guard<std::mutex> lock(g_eventMutex);
+        auto it = g_events.find(id);
+        if (it != g_events.end()) {
+            return it->second;
+        }
+        auto ev = std::make_shared<GuestEvent>();
+        ev->manualReset = manualReset;
+        ev->signaled = initialSignaled;
+        g_events[id] = ev;
+        return ev;
+    }
+
     // TLS emulation (64 slots per thread)
     constexpr size_t MAX_TLS_SLOTS = 64;
     bool g_tlsAllocated[MAX_TLS_SLOTS] = { false };
+    uint64_t g_mainTlsValues[MAX_TLS_SLOTS] = { 0 };
     thread_local uint64_t t_tlsValues[MAX_TLS_SLOTS] = { 0 };
     std::mutex g_tlsMutex;
 
@@ -26,11 +52,13 @@ namespace {
     struct GuestThread {
         uint32_t id{ 0 };
         uint32_t handle{ 0 };
+        uint32_t apiStartup{ 0 };
         uint32_t startAddress{ 0 };
         uint32_t startContext{ 0 };
         uint32_t stackAlloc{ 0 };
         uint32_t stackTop{ 0 };
         std::atomic<bool> resumed{ false };
+        PPCContext* volatile currentCtx{ nullptr };
         std::thread hostThread;
     };
 
@@ -46,6 +74,20 @@ namespace HLE {
 
     void SetVerboseLogging(bool verbose) {
         g_verboseHle = verbose;
+    }
+
+    void DumpThreadStates() {
+        std::lock_guard<std::mutex> lock(g_threadMutex);
+        for (const auto& [handle, th] : g_threadsByHandle) {
+            if (th->currentCtx) {
+                std::cout << "\033[1;33m[Watchdog] Guest Thread 0x" << std::hex << handle
+                          << " LR=0x" << th->currentCtx->lr
+                          << " CTR=0x" << th->currentCtx->ctr.u64
+                          << " SP=0x" << th->currentCtx->r1.u32
+                          << " R3=0x" << th->currentCtx->r3.u64
+                          << std::dec << "\033[0m" << std::endl;
+            }
+        }
     }
 }
 
@@ -151,14 +193,20 @@ HLE_STUB_DEFAULT(XamTaskSchedule)
 // Custom HLE implementation for RtlInitializeCriticalSection
 PPC_FUNC(__imp__RtlInitializeCriticalSection) {
     uint32_t csAddr = ctx.r3.u32;
-    std::lock_guard<std::mutex> lock(g_csMutex);
-    g_criticalSections[csAddr] = std::make_unique<std::recursive_mutex>();
+    if (csAddr != 0) {
+        std::lock_guard<std::mutex> lock(g_csMutex);
+        g_criticalSections[csAddr] = std::make_unique<std::recursive_mutex>();
+    }
     ctx.r3.u64 = STATUS_SUCCESS;
 }
 
 // Custom HLE implementation for RtlLeaveCriticalSection
 PPC_FUNC(__imp__RtlLeaveCriticalSection) {
     uint32_t csAddr = ctx.r3.u32;
+    if (csAddr == 0) {
+        ctx.r3.u64 = STATUS_SUCCESS;
+        return;
+    }
     std::recursive_mutex* mtx = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_csMutex);
@@ -174,6 +222,10 @@ PPC_FUNC(__imp__RtlLeaveCriticalSection) {
 // Custom HLE implementation for RtlEnterCriticalSection
 PPC_FUNC(__imp__RtlEnterCriticalSection) {
     uint32_t csAddr = ctx.r3.u32;
+    if (csAddr == 0) {
+        ctx.r3.u64 = STATUS_SUCCESS;
+        return;
+    }
     std::recursive_mutex* mtx = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_csMutex);
@@ -186,7 +238,13 @@ PPC_FUNC(__imp__RtlEnterCriticalSection) {
             g_criticalSections[csAddr] = std::move(newMtx);
         }
     }
-    if (mtx) mtx->lock();
+    if (mtx) {
+        if (!mtx->try_lock()) {
+            std::cout << "\033[1;33m[HLE] CriticalSection 0x" << std::hex << csAddr
+                      << " CONTENDED (caller=0x" << ctx.lr << "), waiting...\033[0m" << std::dec << std::endl;
+            mtx->lock();
+        }
+    }
     ctx.r3.u64 = STATUS_SUCCESS;
 }
 
@@ -216,7 +274,47 @@ PPC_FUNC(__imp__NtClose) {
 
 // Custom HLE implementation for NtWaitForSingleObjectEx
 PPC_FUNC(__imp__NtWaitForSingleObjectEx) {
-    ctx.r3.u64 = STATUS_SUCCESS;
+    uint32_t handle = ctx.r3.u32;
+    uint32_t timeoutPtr = ctx.r6.u32;
+    std::shared_ptr<GuestEvent> ev;
+    {
+        std::lock_guard<std::mutex> lock(g_eventMutex);
+        auto it = g_events.find(handle);
+        if (it != g_events.end()) ev = it->second;
+    }
+    if (!ev) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        ctx.r3.u64 = STATUS_SUCCESS;
+        return;
+    }
+    std::unique_lock<std::mutex> lock(ev->mtx);
+    if (timeoutPtr == 0) {
+        bool ok = ev->cv.wait_for(lock, std::chrono::milliseconds(50), [&ev]() { return ev->signaled; });
+        if (ok && !ev->manualReset) {
+            ev->signaled = false;
+        }
+        ctx.r3.u64 = STATUS_SUCCESS;
+    } else {
+        int64_t rawTimeout = static_cast<int64_t>(GuestReadU64(base, timeoutPtr));
+        if (rawTimeout == 0) {
+            if (ev->signaled) {
+                if (!ev->manualReset) ev->signaled = false;
+                ctx.r3.u64 = STATUS_SUCCESS;
+            } else {
+                ctx.r3.u64 = 0x00000102; // STATUS_TIMEOUT
+            }
+        } else {
+            int64_t ms = (rawTimeout < 0 ? -rawTimeout : rawTimeout) / 10000;
+            if (ms < 1) ms = 1;
+            bool ok = ev->cv.wait_for(lock, std::chrono::milliseconds(ms), [&ev]() { return ev->signaled; });
+            if (ok) {
+                if (!ev->manualReset) ev->signaled = false;
+                ctx.r3.u64 = STATUS_SUCCESS;
+            } else {
+                ctx.r3.u64 = 0x00000102; // STATUS_TIMEOUT
+            }
+        }
+    }
 }
 
 HLE_STUB_DEFAULT(NtWriteFile)
@@ -275,9 +373,13 @@ HLE_STUB_DEFAULT(NtDeviceIoControlFile)
 PPC_FUNC(__imp__NtCreateEvent) {
     // r3: EventHandle*, r4: DesiredAccess, r5: ObjectAttributes, r6: EventType, r7: InitialState
     uint32_t handlePtr = ctx.r3.u32;
+    bool manualReset = (ctx.r6.u32 == 0);
+    bool initialState = (ctx.r7.u32 != 0);
+    static std::atomic<uint32_t> s_nextHandle{ 0x1000 };
+    uint32_t h = s_nextHandle.fetch_add(4);
+    GetOrCreateEvent(h, manualReset, initialState);
     if (handlePtr != 0) {
-        static uint32_t s_eventHandleCounter = 0x1000;
-        GuestWriteU32(base, handlePtr, ++s_eventHandleCounter);
+        GuestWriteU32(base, handlePtr, h);
     }
     ctx.r3.u64 = STATUS_SUCCESS;
 }
@@ -364,11 +466,51 @@ PPC_FUNC(__imp__ObDereferenceObject) {
 
 // Custom HLE implementation for KeWaitForSingleObject
 PPC_FUNC(__imp__KeWaitForSingleObject) {
-    ctx.r3.u64 = STATUS_SUCCESS;
+    uint32_t objAddr = ctx.r3.u32;
+    uint32_t timeoutPtr = ctx.r7.u32;
+    auto ev = GetOrCreateEvent(objAddr, false, false);
+    std::unique_lock<std::mutex> lock(ev->mtx);
+    if (timeoutPtr == 0) {
+        bool ok = ev->cv.wait_for(lock, std::chrono::milliseconds(50), [&ev]() { return ev->signaled; });
+        if (ok && !ev->manualReset) {
+            ev->signaled = false;
+        }
+        ctx.r3.u64 = STATUS_SUCCESS;
+    } else {
+        int64_t rawTimeout = static_cast<int64_t>(GuestReadU64(base, timeoutPtr));
+        if (rawTimeout == 0) {
+            if (ev->signaled) {
+                if (!ev->manualReset) ev->signaled = false;
+                ctx.r3.u64 = STATUS_SUCCESS;
+            } else {
+                ctx.r3.u64 = 0x00000102; // STATUS_TIMEOUT
+            }
+        } else {
+            int64_t ms = (rawTimeout < 0 ? -rawTimeout : rawTimeout) / 10000;
+            if (ms < 1) ms = 1;
+            bool ok = ev->cv.wait_for(lock, std::chrono::milliseconds(ms), [&ev]() { return ev->signaled; });
+            if (ok) {
+                if (!ev->manualReset) ev->signaled = false;
+                ctx.r3.u64 = STATUS_SUCCESS;
+            } else {
+                ctx.r3.u64 = 0x00000102; // STATUS_TIMEOUT
+            }
+        }
+    }
 }
 
 // Custom HLE implementation for KeSetEvent
 PPC_FUNC(__imp__KeSetEvent) {
+    uint32_t objAddr = ctx.r3.u32;
+    auto ev = GetOrCreateEvent(objAddr, false, false);
+    {
+        std::lock_guard<std::mutex> lock(ev->mtx);
+        ev->signaled = true;
+        ev->cv.notify_one();
+    }
+    if (objAddr != 0) {
+        GuestWriteU32(base, objAddr + 4, 1);
+    }
     ctx.r3.u64 = 0;
 }
 
@@ -416,17 +558,20 @@ PPC_FUNC(__imp__ExCreateThread) {
 
     HLE_LOG("ExCreateThread");
 
-    if (stackSize < 0x10000) stackSize = 0x10000;
+    if (stackSize < 0x40000) stackSize = 0x40000;
     stackSize = (stackSize + 0xFFFF) & ~0xFFFF;
 
-    uint32_t stackAlloc = MemoryManager::Instance().AllocateGuestMemory(stackSize, 16384);
+    static std::atomic<uint32_t> s_nextThreadStackBase{ 0x60000000 };
+    uint32_t stackAlloc = s_nextThreadStackBase.fetch_add(stackSize);
     uint32_t stackTop = stackAlloc + stackSize - 256;
+    std::memset(base + stackAlloc, 0, stackSize);
 
     auto th = std::make_shared<GuestThread>();
     {
         std::lock_guard<std::mutex> lock(g_threadMutex);
         th->handle = g_nextThreadHandle++;
         th->id = th->handle;
+        th->apiStartup = apiStartup;
         th->startAddress = startAddress;
         th->startContext = startContext;
         th->stackAlloc = stackAlloc;
@@ -443,7 +588,8 @@ PPC_FUNC(__imp__ExCreateThread) {
     }
 
     std::cout << "\033[1;36m[HLE] Created Guest Thread: handle=0x" << std::hex << th->handle
-              << ", entry=0x" << startAddress << ", context=0x" << startContext
+              << ", entry=0x" << startAddress << ", startup=0x" << apiStartup
+              << ", context=0x" << startContext
               << ", stackTop=0x" << stackTop << ", suspended=" << ((creationFlags & 1) ? "yes" : "no")
               << std::dec << "\033[0m" << std::endl;
 
@@ -452,21 +598,32 @@ PPC_FUNC(__imp__ExCreateThread) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
 
-        std::cout << "\033[1;36m[HLE] Thread 0x" << std::hex << th->handle
-                  << " executing at 0x" << th->startAddress << "...\033[0m" << std::endl;
-
         alignas(64) PPCContext threadCtx{};
         threadCtx.r1.u64 = th->stackTop;
-        threadCtx.r3.u64 = th->startContext;
         threadCtx.fpscr.setcsr(0x1F80);
+        th->currentCtx = &threadCtx;
 
-        if (th->startAddress >= PPC_CODE_BASE && th->startAddress < (PPC_CODE_BASE + PPC_CODE_SIZE)) {
-            (PPC_LOOKUP_FUNC(base, th->startAddress))(threadCtx, base);
+        uint32_t entryPoint = th->startAddress;
+        if (th->apiStartup != 0) {
+            entryPoint = th->apiStartup;
+            threadCtx.r3.u64 = th->startAddress;
+            threadCtx.r4.u64 = th->startContext;
         } else {
-            std::cerr << "\033[1;31m[HLE] Thread 0x" << std::hex << th->handle
-                      << " invalid entry point: 0x" << th->startAddress << "\033[0m" << std::endl;
+            threadCtx.r3.u64 = th->startContext;
         }
 
+        std::cout << "\033[1;36m[HLE] Thread 0x" << std::hex << th->handle
+                  << " executing at entry 0x" << entryPoint
+                  << " (target=0x" << th->startAddress << ", ctx=0x" << th->startContext << ")...\033[0m" << std::endl;
+
+        if (entryPoint >= PPC_CODE_BASE && entryPoint < (PPC_CODE_BASE + PPC_CODE_SIZE)) {
+            (PPC_LOOKUP_FUNC(base, entryPoint))(threadCtx, base);
+        } else {
+            std::cerr << "\033[1;31m[HLE] Thread 0x" << std::hex << th->handle
+                      << " invalid entry point: 0x" << entryPoint << "\033[0m" << std::endl;
+        }
+
+        th->currentCtx = nullptr;
         std::cout << "\033[1;36m[HLE] Thread 0x" << std::hex << th->handle
                   << " completed execution.\033[0m" << std::endl;
     });
@@ -526,13 +683,21 @@ PPC_FUNC(__imp__NtAllocateVirtualMemory) {
     uint32_t baseAddrPtr = ctx.r3.u32;
     uint32_t sizePtr = ctx.r5.u32;
     if (baseAddrPtr != 0 && sizePtr != 0) {
+        uint32_t reqAddr = GuestReadU32(base, baseAddrPtr);
         uint32_t size = GuestReadU32(base, sizePtr);
-        uint32_t allocated = MemoryManager::Instance().AllocateGuestMemory(size);
-        if (allocated != 0 && size >= 512) {
-            GuestWriteU8(base, allocated + 379, 1);
+        uint32_t allocated = reqAddr;
+        if (allocated == 0) {
+            allocated = MemoryManager::Instance().AllocateGuestMemory(size);
+            GuestWriteU32(base, baseAddrPtr, allocated);
         }
-        GuestWriteU32(base, baseAddrPtr, allocated);
-        ctx.r3.u64 = allocated ? STATUS_SUCCESS : STATUS_NO_MEMORY;
+        if (allocated != 0) {
+            if (size >= 512) {
+                GuestWriteU8(base, allocated + 379, 1);
+            }
+            ctx.r3.u64 = STATUS_SUCCESS;
+        } else {
+            ctx.r3.u64 = STATUS_NO_MEMORY;
+        }
     } else {
         ctx.r3.u64 = STATUS_INVALID_PARAMETER;
     }
@@ -548,6 +713,15 @@ HLE_STUB_DEFAULT(ObDeleteSymbolicLink)
 
 // Custom HLE implementation for KeResetEvent
 PPC_FUNC(__imp__KeResetEvent) {
+    uint32_t objAddr = ctx.r3.u32;
+    auto ev = GetOrCreateEvent(objAddr, false, false);
+    {
+        std::lock_guard<std::mutex> lock(ev->mtx);
+        ev->signaled = false;
+    }
+    if (objAddr != 0) {
+        GuestWriteU32(base, objAddr + 4, 0);
+    }
     ctx.r3.u64 = 0;
 }
 
@@ -555,6 +729,22 @@ HLE_STUB_DEFAULT(ExRegisterTitleTerminateNotification)
 
 // Custom HLE implementation for NtSetEvent
 PPC_FUNC(__imp__NtSetEvent) {
+    uint32_t handle = ctx.r3.u32;
+    std::shared_ptr<GuestEvent> ev;
+    {
+        std::lock_guard<std::mutex> lock(g_eventMutex);
+        auto it = g_events.find(handle);
+        if (it != g_events.end()) ev = it->second;
+    }
+    if (ev) {
+        std::lock_guard<std::mutex> lock(ev->mtx);
+        ev->signaled = true;
+        if (ev->manualReset) {
+            ev->cv.notify_all();
+        } else {
+            ev->cv.notify_one();
+        }
+    }
     ctx.r3.u64 = STATUS_SUCCESS;
 }
 
@@ -719,14 +909,19 @@ PPC_FUNC(__imp__KeBugCheckEx) {
 
 // Custom HLE implementation for KeGetCurrentProcessType
 PPC_FUNC(__imp__KeGetCurrentProcessType) {
-    HLE_LOG("KeGetCurrentProcessType");
-    if (ctx.r3.u32 >= 0x10000000 && ctx.r3.u32 < 0x40000000) {
+    static bool loggedOnce = false;
+    if (!loggedOnce && g_verboseHle) {
+        std::cout << "[HLE] KeGetCurrentProcessType called (Title Process)" << std::endl;
+        loggedOnce = true;
+    }
+    if (ctx.r3.u32 >= 0x10000000 && ctx.r3.u32 < 0x80000000) {
         GuestWriteU8(base, ctx.r3.u32 + 379, 1);
     }
-    if (ctx.r30.u32 >= 0x10000000 && ctx.r30.u32 < 0x40000000) {
+    if (ctx.r30.u32 >= 0x10000000 && ctx.r30.u32 < 0x80000000) {
         GuestWriteU8(base, ctx.r30.u32 + 379, 1);
     }
     GuestWriteU8(base, 0x10000000 + 379, 1);
+    GuestWriteU8(base, 0x50000000 + 379, 1);
     ctx.r3.u64 = 1; // 1 = Title Process
 }
 
@@ -848,7 +1043,12 @@ HLE_STUB_DEFAULT(XMsgInProcessCall)
 
 HLE_STUB_DEFAULT(XamGetPrivateEnumStructureFromHandle)
 
-HLE_STUB_DEFAULT(XamNotifyCreateListener)
+// Custom HLE implementation for XamNotifyCreateListener
+PPC_FUNC(__imp__XamNotifyCreateListener) {
+    HLE_LOG("XamNotifyCreateListener");
+    static std::atomic<uint32_t> s_nextListenerHandle{ 0x6001 };
+    ctx.r3.u64 = s_nextListenerHandle.fetch_add(1);
+}
 
 // Custom HLE implementation for XamInputGetCapabilities
 PPC_FUNC(__imp__XamInputGetCapabilities) {
@@ -928,13 +1128,35 @@ HLE_STUB_DEFAULT(XamContentSetThumbnail)
 
 HLE_STUB_DEFAULT(XamContentGetCreator)
 
-HLE_STUB_DEFAULT(XamContentCreateEnumerator)
+// Custom HLE implementation for XamContentCreateEnumerator
+PPC_FUNC(__imp__XamContentCreateEnumerator) {
+    HLE_LOG("XamContentCreateEnumerator");
+    uint32_t pcbBuffer = ctx.r8.u32;
+    uint32_t phEnum = ctx.r9.u32;
+    if (pcbBuffer != 0) {
+        GuestWriteU32(base, pcbBuffer, 308);
+    }
+    if (phEnum != 0) {
+        static std::atomic<uint32_t> s_nextEnumHandle{ 0x7001 };
+        GuestWriteU32(base, phEnum, s_nextEnumHandle.fetch_add(1));
+    }
+    ctx.r3.u64 = 0; // ERROR_SUCCESS
+}
 
 HLE_STUB_DEFAULT(XamContentGetDeviceState)
 
 HLE_STUB_DEFAULT(XamContentGetDeviceData)
 
-HLE_STUB_DEFAULT(XamEnumerate)
+// Custom HLE implementation for XamEnumerate
+PPC_FUNC(__imp__XamEnumerate) {
+    HLE_LOG("XamEnumerate");
+    uint32_t itemsReturnedPtr = ctx.r7.u32;
+    if (itemsReturnedPtr != 0) {
+        GuestWriteU32(base, itemsReturnedPtr, 0);
+    }
+    // Return ERROR_NO_MORE_FILES (18 = 0x12) so enumeration loop completes
+    ctx.r3.u64 = 18;
+}
 
 // Custom HLE implementation for XamGetExecutionId
 PPC_FUNC(__imp__XamGetExecutionId) {
@@ -958,14 +1180,20 @@ PPC_FUNC(__imp__XamGetExecutionId) {
 // Custom HLE implementation for RtlInitializeCriticalSectionAndSpinCount
 PPC_FUNC(__imp__RtlInitializeCriticalSectionAndSpinCount) {
     uint32_t csAddr = ctx.r3.u32;
-    std::lock_guard<std::mutex> lock(g_csMutex);
-    g_criticalSections[csAddr] = std::make_unique<std::recursive_mutex>();
+    if (csAddr != 0) {
+        std::lock_guard<std::mutex> lock(g_csMutex);
+        g_criticalSections[csAddr] = std::make_unique<std::recursive_mutex>();
+    }
     ctx.r3.u64 = STATUS_SUCCESS;
 }
 
 // Custom HLE implementation for RtlTryEnterCriticalSection
 PPC_FUNC(__imp__RtlTryEnterCriticalSection) {
     uint32_t csAddr = ctx.r3.u32;
+    if (csAddr == 0) {
+        ctx.r3.u64 = 1;
+        return;
+    }
     std::recursive_mutex* mtx = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_csMutex);
@@ -997,6 +1225,10 @@ PPC_FUNC(__imp__KeTlsSetValue) {
     uint64_t value = ctx.r4.u64;
     if (slot < MAX_TLS_SLOTS) {
         t_tlsValues[slot] = value;
+        {
+            std::lock_guard<std::mutex> lock(g_tlsMutex);
+            g_mainTlsValues[slot] = value;
+        }
         ctx.r3.u64 = 1; // TRUE
     } else {
         ctx.r3.u64 = 0; // FALSE
@@ -1007,7 +1239,12 @@ PPC_FUNC(__imp__KeTlsSetValue) {
 PPC_FUNC(__imp__KeTlsGetValue) {
     uint32_t slot = ctx.r3.u32;
     if (slot < MAX_TLS_SLOTS) {
-        ctx.r3.u64 = t_tlsValues[slot];
+        uint64_t val = t_tlsValues[slot];
+        if (val == 0 && slot == 0) {
+            std::lock_guard<std::mutex> lock(g_tlsMutex);
+            val = g_mainTlsValues[0];
+        }
+        ctx.r3.u64 = val;
     } else {
         ctx.r3.u64 = 0;
     }
@@ -1065,6 +1302,17 @@ HLE_STUB_DEFAULT(NtWaitForMultipleObjectsEx)
 
 // Custom HLE implementation for NtClearEvent
 PPC_FUNC(__imp__NtClearEvent) {
+    uint32_t handle = ctx.r3.u32;
+    std::shared_ptr<GuestEvent> ev;
+    {
+        std::lock_guard<std::mutex> lock(g_eventMutex);
+        auto it = g_events.find(handle);
+        if (it != g_events.end()) ev = it->second;
+    }
+    if (ev) {
+        std::lock_guard<std::mutex> lock(ev->mtx);
+        ev->signaled = false;
+    }
     ctx.r3.u64 = STATUS_SUCCESS;
 }
 
@@ -1402,7 +1650,24 @@ PPC_FUNC(__imp__KfLowerIrql) {
 }
 
 PPC_FUNC(__imp__KeResumeThread) {
+    uint32_t handle = ctx.r3.u32;
     HLE_LOG("KeResumeThread");
+    std::shared_ptr<GuestThread> targetThread = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_threadMutex);
+        auto it = g_threadsByHandle.find(handle);
+        if (it != g_threadsByHandle.end()) {
+            targetThread = it->second;
+        } else {
+            for (auto& pair : g_threadsByHandle) {
+                pair.second->resumed.store(true, std::memory_order_release);
+            }
+        }
+    }
+    if (targetThread) {
+        targetThread->resumed.store(true, std::memory_order_release);
+        std::cout << "\033[1;36m[HLE] KeResumeThread resumed Guest Thread 0x" << std::hex << targetThread->handle << "\033[0m" << std::endl;
+    }
     ctx.r3.u64 = 1; // Previous suspend count
 }
 
@@ -1465,3 +1730,29 @@ PPC_FUNC(__imp__NtCreateTimer) {
     }
     ctx.r3.u64 = STATUS_SUCCESS;
 }
+
+// Native override for weak sub_8215B288 (array setter & callback dispatcher)
+// Avoids fatal invalid indirect calls when callback slot contains a heap/context pointer
+PPC_FUNC(sub_8215B288) {
+    uint32_t structPtr = ctx.r3.u32;
+    uint32_t index = ctx.r4.u32;
+    uint32_t value = ctx.r5.u32;
+
+    uint32_t baseObj = GuestReadU32(base, 0x833A376C);
+    if (baseObj != 0) {
+        uint32_t tablePtr = GuestReadU32(base, baseObj + 16);
+        if (tablePtr != 0) {
+            uint32_t callback = GuestReadU32(base, tablePtr + index + 64);
+            if (callback >= PPC_CODE_BASE && callback < (PPC_CODE_BASE + PPC_CODE_SIZE)) {
+                ctx.ctr.u64 = callback;
+                ctx.lr = 0x8215B2C0;
+                (PPC_LOOKUP_FUNC(base, callback))(ctx, base);
+            }
+        }
+    }
+
+    if (structPtr != 0) {
+        GuestWriteU32(base, structPtr + (index * 4), value);
+    }
+}
+

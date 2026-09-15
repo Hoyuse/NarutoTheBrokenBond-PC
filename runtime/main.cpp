@@ -3,6 +3,9 @@
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
+#include <chrono>
+#include <thread>
 #include "ppc_context.h"
 #include "ppc_recomp_shared.h"
 #include "memory_manager.h"
@@ -132,9 +135,24 @@ int main(int argc, char** argv) {
     std::cout << "\n\033[1;32m[Runtime] Starting execution at entry point _xstart (0x"
               << std::hex << mm.GetEntryPoint() << ") with stack 0x" << ctx.r1.u64 << " ...\033[0m\n" << std::dec << std::endl;
 
+    std::atomic<bool> isRunning{ true };
+    std::thread watchdog([&isRunning]() {
+        while (isRunning.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (!isRunning.load(std::memory_order_relaxed)) break;
+            if (g_activeContext) {
+                std::cout << "\033[1;35m[Watchdog] Main Thread LR=0x" << std::hex << g_activeContext->lr
+                          << " SP=0x" << g_activeContext->r1.u32 << std::dec << "\033[0m" << std::endl;
+            }
+            HLE::DumpThreadStates();
+        }
+    });
+    watchdog.detach();
+
     // Invoke entry point
     _xstart(ctx, base);
 
+    isRunning.store(false);
     std::cout << "\n\033[1;32m[Runtime] Execution finished. _xstart returned cleanly.\033[0m" << std::endl;
 
     return 0;

@@ -5,4 +5,5 @@
 namespace HLE {
     void Initialize();
     void SetVerboseLogging(bool verbose);
+    void DumpThreadStates();
 }

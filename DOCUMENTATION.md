@@ -73,6 +73,18 @@ El ejecutable de Xbox 360 interactúa con el sistema operativo a través de impo
    - *Causa*: La macro `PPC_LOOKUP_FUNC` con entrada `0` producía un subdesbordamiento aritmético de 64 bits equivalente a un offset de `-2.16 GB`.
    - *Solución*: Asignación virtual de 16 GB con la base del guest desplazada +4 GB, vinculando la entrada nula a un manejador seguro (`SafeIndirectPPCFunc`).
 
-3. **Congelamiento de Inicialización**:
-   - *Causa*: Los hilos de soporte no eran creados físicamente y `VdIsHSIOTrainingSucceeded` reportaba fallo de entrenamiento.
-   - *Solución*: Implementación de hilos nativos independientes y confirmación de estado listo en los stubs de video.
+4. **Deadlock en `LR=0x8221f458` (CRT `_lock`)**:
+   - *Causa*: Los hilos secundarios tenían su stack inicializado en `0x50000000`, colisionando con su estructura `_tiddata` del CRT. Esto causaba corrupción del puntero de entrada y muerte de hilos mientras retenían CriticalSections (`0x82e2f898`), bloqueando el Main Thread indefinidamente.
+   - *Solución*: Asignación dedicada de pilas para hilos guest en el rango `0x60000000 - 0x6E000000` (`s_nextThreadStackBase`), aislamiento estricto de herencia TLS (slot 0) y soporte no-op seguro para CriticalSections con dirección 0.
+
+5. **Bucle Infinito en Enumeración de Contenido (`NtResumeThread` / `XamEnumerate`)**:
+   - *Causa*: `XamEnumerate` no escribía `*itemsReturned = 0` ni devolvía `ERROR_NO_MORE_FILES` (18), provocando que el bucle de enumeración de partidas/DLC no terminara nunca.
+   - *Solución*: Implementación de `XamContentCreateEnumerator` y `XamEnumerate` devolviendo handle válido (`0x7001+`), 0 items y código 18 (`ERROR_NO_MORE_FILES`).
+
+6. **Crash por Invocación Indirecta de Direcciones del Heap (`sub_8215B288`, CTR=`0x50011c08`)**:
+   - *Causa*: Durante la inicialización de configuraciones de video/motor, `sub_8215B288` ejecutaba un salto indirecto incondicional (`bctrl`). Para ciertos índices, la tabla contenía referencias a estructuras de datos o punteros del heap (`0x50011c08`), provocando que `PPC_LOOKUP_FUNC` calculara un offset fuera del rango de código ejecutable (`0x82120000 - 0x82C7A2F8`), produciendo un puntero host nulo y resultando en SIGSEGV.
+   - *Solución*: Sobrescritura nativa del símbolo débil `sub_8215B288` en `runtime/hle_stubs.cpp`, ejecutando las escrituras en el arreglo de configuraciones y filtrando la ejecución de callbacks únicamente a direcciones dentro del rango de código válido de PPC.
+
+7. **Hito de Ejecución Multihilo Concurrente**:
+   - El motor de *Naruto: The Broken Bond* inicializa de forma exitosa y ejecuta concurrentemente 8 hilos (Main Thread + 7 Guest Threads de trabajo `0x5000` a `0x5006`), alternando activamente en el bucle principal de temporización y procesamiento de tareas sin fallos ni bloqueos.
+
