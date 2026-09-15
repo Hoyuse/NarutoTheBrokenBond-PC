@@ -44,6 +44,7 @@ add_executable(naruto_runtime
     runtime/main.cpp
     runtime/memory_manager.cpp
     runtime/hle_stubs.cpp
+    runtime/vfs.cpp
 )
 
 target_include_directories(naruto_runtime PRIVATE

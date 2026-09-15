@@ -30,3 +30,4 @@ XenonRecomp/XenonAnalyse/main.cpp.bak
 
 # Temporary
 scratch/
+*.log

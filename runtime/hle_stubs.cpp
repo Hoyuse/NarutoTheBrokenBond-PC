@@ -1,5 +1,6 @@
 #include "hle_stubs.h"
 #include "memory_manager.h"
+#include "vfs.h"
 #include <iostream>
 #include <iomanip>
 #include <chrono>
@@ -27,6 +28,25 @@ namespace {
 
     std::mutex g_eventMutex;
     std::unordered_map<uint32_t, std::shared_ptr<GuestEvent>> g_events;
+
+    void SignalGuestEvent(uint32_t handle) {
+        if (handle == 0) return;
+        std::shared_ptr<GuestEvent> ev;
+        {
+            std::lock_guard<std::mutex> lock(g_eventMutex);
+            auto it = g_events.find(handle);
+            if (it != g_events.end()) ev = it->second;
+        }
+        if (ev) {
+            std::lock_guard<std::mutex> lock(ev->mtx);
+            ev->signaled = true;
+            if (ev->manualReset) {
+                ev->cv.notify_all();
+            } else {
+                ev->cv.notify_one();
+            }
+        }
+    }
 
     std::shared_ptr<GuestEvent> GetOrCreateEvent(uint32_t id, bool manualReset = false, bool initialSignaled = false) {
         std::lock_guard<std::mutex> lock(g_eventMutex);
@@ -215,7 +235,10 @@ PPC_FUNC(__imp__RtlLeaveCriticalSection) {
             mtx = it->second.get();
         }
     }
-    if (mtx) mtx->unlock();
+    if (mtx) {
+        mtx->unlock();
+        std::this_thread::yield();
+    }
     ctx.r3.u64 = STATUS_SUCCESS;
 }
 
@@ -240,15 +263,22 @@ PPC_FUNC(__imp__RtlEnterCriticalSection) {
     }
     if (mtx) {
         if (!mtx->try_lock()) {
-            std::cout << "\033[1;33m[HLE] CriticalSection 0x" << std::hex << csAddr
-                      << " CONTENDED (caller=0x" << ctx.lr << "), waiting...\033[0m" << std::dec << std::endl;
+            std::this_thread::yield();
             mtx->lock();
         }
     }
     ctx.r3.u64 = STATUS_SUCCESS;
 }
 
-HLE_STUB_DEFAULT(NtSetInformationFile)
+// Custom HLE implementation for NtSetInformationFile
+PPC_FUNC(__imp__NtSetInformationFile) {
+    uint32_t handle = ctx.r3.u32;
+    uint32_t ioStatusPtr = ctx.r4.u32;
+    uint32_t infoPtr = ctx.r5.u32;
+    uint32_t length = ctx.r6.u32;
+    uint32_t infoClass = ctx.r7.u32;
+    ctx.r3.u64 = VFS::SetInformationFile(base, handle, ioStatusPtr, infoPtr, length, infoClass);
+}
 
 // Custom HLE implementation for RtlCompareStringN
 PPC_FUNC(__imp__RtlCompareStringN) {
@@ -269,6 +299,8 @@ PPC_FUNC(__imp__RtlCompareStringN) {
 
 // Custom HLE implementation for NtClose
 PPC_FUNC(__imp__NtClose) {
+    uint32_t handle = ctx.r3.u32;
+    VFS::CloseFile(handle);
     ctx.r3.u64 = STATUS_SUCCESS;
 }
 
@@ -344,28 +376,39 @@ HLE_STUB_DEFAULT(NtQueryVolumeInformationFile)
 
 PPC_FUNC(__imp__NtOpenFile) {
     uint32_t handlePtr = ctx.r3.u32;
-    (void)handlePtr;
+    uint32_t desiredAccess = ctx.r4.u32;
     uint32_t objAttrPtr = ctx.r5.u32;
-    std::string path = "unknown";
-    if (objAttrPtr != 0) {
-        uint32_t ansiStrPtr = GuestReadU32(base, objAttrPtr + 4);
-        if (ansiStrPtr != 0) {
-            uint32_t bufPtr = GuestReadU32(base, ansiStrPtr + 4);
-            if (bufPtr != 0) {
-                path = reinterpret_cast<const char*>(base + bufPtr);
-            }
-        }
-    }
-    std::cout << "\033[1;35m[HLE] NtOpenFile requested: " << path << "\033[0m" << std::endl;
-    // Return STATUS_OBJECT_NAME_NOT_FOUND so the CRT knows the optional file is absent
-    ctx.r3.u64 = STATUS_OBJECT_NAME_NOT_FOUND;
+    uint32_t ioStatusPtr = ctx.r6.u32;
+    uint32_t shareAccess = ctx.r7.u32;
+    uint32_t openOptions = ctx.r8.u32;
+    ctx.r3.u64 = VFS::OpenFile(base, handlePtr, desiredAccess, objAttrPtr, ioStatusPtr, shareAccess, openOptions);
 }
 
-HLE_STUB_DEFAULT(NtQueryInformationFile)
+// Custom HLE implementation for NtQueryInformationFile
+PPC_FUNC(__imp__NtQueryInformationFile) {
+    uint32_t handle = ctx.r3.u32;
+    uint32_t ioStatusPtr = ctx.r4.u32;
+    uint32_t infoPtr = ctx.r5.u32;
+    uint32_t length = ctx.r6.u32;
+    uint32_t infoClass = ctx.r7.u32;
+    ctx.r3.u64 = VFS::QueryInformationFile(base, handle, ioStatusPtr, infoPtr, length, infoClass);
+}
 
 HLE_STUB_DEFAULT(RtlImageXexHeaderField)
 
-HLE_STUB_DEFAULT(NtCreateFile)
+// Custom HLE implementation for NtCreateFile
+PPC_FUNC(__imp__NtCreateFile) {
+    uint32_t handlePtr = ctx.r3.u32;
+    uint32_t desiredAccess = ctx.r4.u32;
+    uint32_t objAttrPtr = ctx.r5.u32;
+    uint32_t ioStatusPtr = ctx.r6.u32;
+    uint32_t allocSizePtr = ctx.r7.u32;
+    uint32_t fileAttributes = ctx.r8.u32;
+    uint32_t shareAccess = ctx.r9.u32;
+    uint32_t createDisposition = ctx.r10.u32;
+    uint32_t createOptions = GuestReadU32(base, ctx.r1.u32 + 84);
+    ctx.r3.u64 = VFS::CreateFile(base, handlePtr, desiredAccess, objAttrPtr, ioStatusPtr, allocSizePtr, fileAttributes, shareAccess, createDisposition, createOptions);
+}
 
 HLE_STUB_DEFAULT(NtDeviceIoControlFile)
 
@@ -531,7 +574,21 @@ HLE_STUB_DEFAULT(XeCryptSha)
 
 HLE_STUB_DEFAULT(IoCompleteRequest)
 
-HLE_STUB_DEFAULT(NtReadFile)
+// Custom HLE implementation for NtReadFile
+PPC_FUNC(__imp__NtReadFile) {
+    uint32_t handle = ctx.r3.u32;
+    uint32_t eventHandle = ctx.r4.u32;
+    uint32_t apcRoutine = ctx.r5.u32;
+    uint32_t apcContext = ctx.r6.u32;
+    uint32_t ioStatusPtr = ctx.r7.u32;
+    uint32_t bufferPtr = ctx.r8.u32;
+    uint32_t length = ctx.r9.u32;
+    uint32_t byteOffsetPtr = ctx.r10.u32;
+    ctx.r3.u64 = VFS::ReadFile(base, handle, eventHandle, apcRoutine, apcContext, ioStatusPtr, bufferPtr, length, byteOffsetPtr);
+    if (eventHandle != 0) {
+        SignalGuestEvent(eventHandle);
+    }
+}
 
 // Custom HLE implementation for KfReleaseSpinLock
 PPC_FUNC(__imp__KfReleaseSpinLock) {
@@ -544,6 +601,33 @@ PPC_FUNC(__imp__KfAcquireSpinLock) {
 }
 
 HLE_STUB_DEFAULT(KeSetBasePriorityThread)
+
+uint32_t HLE::CreateKPCR(uint8_t* base, uint32_t threadId, uint8_t cpuId, uint32_t stackAlloc, uint32_t stackTop) {
+    static std::atomic<uint32_t> s_nextKernelBlock{ 0x51000000 };
+    uint32_t kpcr_addr = s_nextKernelBlock.fetch_add(0x800);
+    uint32_t kthread_addr = kpcr_addr + 0x400;
+
+    std::memset(base + kpcr_addr, 0, 0x800);
+
+    GuestKPCR* pcr = reinterpret_cast<GuestKPCR*>(base + kpcr_addr);
+    pcr->pcr_ptr = __builtin_bswap32(kpcr_addr);
+    pcr->stack_base_ptr = __builtin_bswap32(stackTop);
+    pcr->stack_end_ptr = __builtin_bswap32(stackAlloc);
+    pcr->current_thread = __builtin_bswap32(kthread_addr);
+    pcr->current_cpu = cpuId;
+
+    GuestKTHREAD* kth = reinterpret_cast<GuestKTHREAD*>(base + kthread_addr);
+    kth->header[0] = 6; // Thread object type
+    kth->state = __builtin_bswap16(0x102);
+    kth->saturation = __builtin_bswap16(1);
+    kth->kernel_time = 0;
+    kth->stack_base = __builtin_bswap32(stackTop);
+    kth->stack_limit = __builtin_bswap32(stackAlloc);
+    kth->thread_id = __builtin_bswap32(threadId);
+    kth->last_error = 0;
+
+    return kpcr_addr;
+}
 
 // Custom HLE implementation for ExCreateThread
 PPC_FUNC(__imp__ExCreateThread) {
@@ -598,8 +682,13 @@ PPC_FUNC(__imp__ExCreateThread) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
 
+        static std::atomic<uint8_t> s_nextCpuId{ 1 };
+        uint8_t cpuId = (s_nextCpuId.fetch_add(1) % 5) + 1;
+        uint32_t kpcr = HLE::CreateKPCR(base, th->id, cpuId, th->stackAlloc, th->stackTop);
+
         alignas(64) PPCContext threadCtx{};
         threadCtx.r1.u64 = th->stackTop;
+        threadCtx.r13.u64 = kpcr;
         threadCtx.fpscr.setcsr(0x1F80);
         th->currentCtx = &threadCtx;
 
@@ -679,28 +768,47 @@ PPC_FUNC(__imp__NtFreeVirtualMemory) {
 
 // Custom HLE implementation for NtAllocateVirtualMemory
 PPC_FUNC(__imp__NtAllocateVirtualMemory) {
-    // r3: BaseAddress ptr, r4: ZeroBits, r5: RegionSize ptr, r6: AllocationType, r7: Protect
+    // Xbox 360 ABI:
+    // r3: BaseAddress ptr, r4: RegionSize ptr, r5: AllocationType, r6: Protect, r7: DebugMemory
     uint32_t baseAddrPtr = ctx.r3.u32;
-    uint32_t sizePtr = ctx.r5.u32;
-    if (baseAddrPtr != 0 && sizePtr != 0) {
-        uint32_t reqAddr = GuestReadU32(base, baseAddrPtr);
-        uint32_t size = GuestReadU32(base, sizePtr);
-        uint32_t allocated = reqAddr;
-        if (allocated == 0) {
-            allocated = MemoryManager::Instance().AllocateGuestMemory(size);
-            GuestWriteU32(base, baseAddrPtr, allocated);
-        }
-        if (allocated != 0) {
-            if (size >= 512) {
-                GuestWriteU8(base, allocated + 379, 1);
-            }
-            ctx.r3.u64 = STATUS_SUCCESS;
-        } else {
-            ctx.r3.u64 = STATUS_NO_MEMORY;
-        }
-    } else {
+    uint32_t sizePtr = ctx.r4.u32;
+    uint32_t allocType = ctx.r5.u32;
+    uint32_t protect = ctx.r6.u32;
+    (void)protect;
+
+    if (baseAddrPtr == 0 || sizePtr == 0) {
         ctx.r3.u64 = STATUS_INVALID_PARAMETER;
+        return;
     }
+
+    uint32_t reqAddr = GuestReadU32(base, baseAddrPtr);
+    uint32_t reqSize = GuestReadU32(base, sizePtr);
+
+    if (reqSize == 0) {
+        ctx.r3.u64 = STATUS_INVALID_PARAMETER;
+        return;
+    }
+
+    uint32_t pageSize = (allocType & 0x20000000) ? 64 * 1024 : 4096;
+    uint32_t alignedSize = (reqSize + pageSize - 1) & ~(pageSize - 1);
+
+    uint32_t allocated = reqAddr;
+    if (allocated == 0) {
+        allocated = MemoryManager::Instance().AllocateGuestMemory(alignedSize, pageSize);
+        if (allocated == 0) {
+            std::cerr << "[HLE] NtAllocateVirtualMemory: failed to allocate " << alignedSize << " bytes!" << std::endl;
+            ctx.r3.u64 = STATUS_NO_MEMORY;
+            return;
+        }
+        GuestWriteU32(base, baseAddrPtr, allocated);
+    }
+
+    GuestWriteU32(base, sizePtr, alignedSize);
+
+    HLE_LOG("NtAllocateVirtualMemory: addr=0x" << std::hex << allocated 
+            << " (size: 0x" << alignedSize << ", type: 0x" << allocType << ")" << std::dec);
+
+    ctx.r3.u64 = STATUS_SUCCESS;
 }
 
 HLE_STUB_DEFAULT(NtFlushBuffersFile)
@@ -748,9 +856,40 @@ PPC_FUNC(__imp__NtSetEvent) {
     ctx.r3.u64 = STATUS_SUCCESS;
 }
 
-HLE_STUB_DEFAULT(NtQueryDirectoryFile)
+// Custom HLE implementation for NtQueryDirectoryFile
+PPC_FUNC(__imp__NtQueryDirectoryFile) {
+    uint32_t handle = ctx.r3.u32;
+    uint32_t eventHandle = ctx.r4.u32;
+    uint32_t apcRoutine = ctx.r5.u32;
+    uint32_t apcContext = ctx.r6.u32;
+    uint32_t ioStatusPtr = ctx.r7.u32;
+    uint32_t bufferPtr = ctx.r8.u32;
+    uint32_t length = ctx.r9.u32;
+    uint32_t infoClass = ctx.r10.u32;
+    bool returnSingleEntry = (GuestReadU32(base, ctx.r1.u32 + 84) != 0);
+    uint32_t fileNameFilterPtr = GuestReadU32(base, ctx.r1.u32 + 88);
+    bool restartScan = (GuestReadU32(base, ctx.r1.u32 + 92) != 0);
+    ctx.r3.u64 = VFS::QueryDirectoryFile(base, handle, eventHandle, apcRoutine, apcContext, ioStatusPtr, bufferPtr, length, infoClass, returnSingleEntry, fileNameFilterPtr, restartScan);
+    if (eventHandle != 0) {
+        SignalGuestEvent(eventHandle);
+    }
+}
 
-HLE_STUB_DEFAULT(NtReadFileScatter)
+// Custom HLE implementation for NtReadFileScatter
+PPC_FUNC(__imp__NtReadFileScatter) {
+    uint32_t handle = ctx.r3.u32;
+    uint32_t eventHandle = ctx.r4.u32;
+    uint32_t apcRoutine = ctx.r5.u32;
+    uint32_t apcContext = ctx.r6.u32;
+    uint32_t ioStatusPtr = ctx.r7.u32;
+    uint32_t segmentArrayPtr = ctx.r8.u32;
+    uint32_t length = ctx.r9.u32;
+    uint32_t byteOffsetPtr = ctx.r10.u32;
+    ctx.r3.u64 = VFS::ReadFileScatter(base, handle, eventHandle, apcRoutine, apcContext, ioStatusPtr, segmentArrayPtr, length, byteOffsetPtr);
+    if (eventHandle != 0) {
+        SignalGuestEvent(eventHandle);
+    }
+}
 
 HLE_STUB_DEFAULT(NtDuplicateObject)
 
@@ -1493,15 +1632,101 @@ PPC_FUNC(__imp__NtReleaseMutant) {
     ctx.r3.u64 = STATUS_SUCCESS;
 }
 
-HLE_STUB_DEFAULT(VdInitializeRingBuffer)
+static uint32_t g_ringBufferPhysAddr = 0;
+static uint32_t g_ringBufferPageCountLog2 = 0;
+static uint32_t g_rptrWritebackAddr = 0;
 
-HLE_STUB_DEFAULT(MmGetPhysicalAddress)
+PPC_FUNC(__imp__VdInitializeRingBuffer) {
+    g_ringBufferPhysAddr = ctx.r3.u32;
+    g_ringBufferPageCountLog2 = ctx.r4.u32;
+    HLE_LOG("VdInitializeRingBuffer: physAddr=0x" << std::hex << g_ringBufferPhysAddr 
+            << ", pagesLog2=" << std::dec << g_ringBufferPageCountLog2);
+    ctx.r3.u64 = STATUS_SUCCESS;
+}
+
+PPC_FUNC(__imp__MmGetPhysicalAddress) {
+    uint32_t va = ctx.r3.u32;
+    uint32_t pa = va & 0x1FFFFFFF;
+    HLE_LOG("MmGetPhysicalAddress: VA=0x" << std::hex << va << " -> PA=0x" << pa << std::dec);
+    ctx.r3.u64 = pa;
+}
 
 HLE_STUB_DEFAULT(KiApcNormalRoutineNop)
 
 HLE_STUB_DEFAULT(VdSetSystemCommandBufferGpuIdentifierAddress)
 
-HLE_STUB_DEFAULT(VdEnableRingBufferRPtrWriteBack)
+PPC_FUNC(__imp__VdEnableRingBufferRPtrWriteBack) {
+    g_rptrWritebackAddr = ctx.r3.u32;
+    uint32_t blockSizeLog2 = ctx.r4.u32;
+    HLE_LOG("VdEnableRingBufferRPtrWriteBack: writebackAddr=0x" << std::hex << g_rptrWritebackAddr 
+            << ", blockSizeLog2=" << std::dec << blockSizeLog2);
+    ctx.r3.u64 = STATUS_SUCCESS;
+}
+
+// Override engine GPU spin-wait watchdog function
+PPC_FUNC(sub_821A1858) {
+    uint32_t waitStruct = ctx.r3.u32;
+    static int s_callCount = 0;
+    if (waitStruct >= 0x10000 && waitStruct < 0xFFFF0000) {
+        uint32_t renderer = PPC_LOAD_U32(waitStruct);
+        if (renderer >= 0x10000 && renderer < 0xFFFF0000) {
+            uint32_t r11_ptr = PPC_LOAD_U32(renderer + 10896);
+            if (r11_ptr >= 0x10000 && r11_ptr < 0xFFFF0000) {
+                uint32_t r10_wptr = PPC_LOAD_U32(renderer + 10908);
+                uint32_t r11_old = PPC_LOAD_U32(r11_ptr + 0);
+                PPC_STORE_U32(r11_ptr + 0, r10_wptr);
+                
+                uint32_t cur48 = PPC_LOAD_U32(renderer + 48);
+                uint32_t cur14920 = PPC_LOAD_U32(renderer + 14920) & 0x3;
+                PPC_STORE_U32(r11_ptr + 4, cur48 | cur14920);
+
+                if (g_rptrWritebackAddr != 0) {
+                    PPC_STORE_U32(g_rptrWritebackAddr, r10_wptr);
+                }
+
+                if (++s_callCount <= 10 || (s_callCount % 1000) == 0) {
+                    std::cout << "[GPU Fence] sub_821A1858: renderer=0x" << std::hex << renderer
+                              << ", wptr=0x" << r10_wptr << ", old_r11=0x" << r11_old << std::dec << std::endl;
+                }
+            } else {
+                if (++s_callCount <= 10) {
+                    std::cout << "[GPU Fence] sub_821A1858: r11_ptr is invalid: 0x" << std::hex << r11_ptr << std::dec << std::endl;
+                }
+            }
+        } else {
+            if (++s_callCount <= 10) {
+                uint32_t callerLR = PPC_LOAD_U32(ctx.r1.u32 + 136);
+                std::cout << "[GPU Fence] sub_821A1858: renderer is invalid: 0x" << std::hex << renderer 
+                          << " (waitStruct=0x" << waitStruct << ", callerLR=0x" << callerLR << ")" << std::dec << std::endl;
+            }
+        }
+    } else {
+        if (++s_callCount <= 10) {
+            uint32_t callerLR = PPC_LOAD_U32(ctx.r1.u32 + 136);
+            std::cout << "[GPU Fence] sub_821A1858: waitStruct is invalid: 0x" << std::hex << waitStruct 
+                      << " (callerLR=0x" << callerLR << ")" << std::dec << std::endl;
+        }
+    }
+
+    // If waitStruct or renderer is 0, return 0 to break the loop!
+    if (waitStruct == 0 || (waitStruct >= 0x10000 && PPC_LOAD_U32(waitStruct) == 0)) {
+        ctx.r3.u64 = 0;
+        return;
+    }
+
+    // Update kernel_time for calling thread
+    if (ctx.r13.u32 != 0) {
+        uint32_t currentThreadAddr = PPC_LOAD_U32(ctx.r13.u32 + 256);
+        if (currentThreadAddr >= 0x10000 && currentThreadAddr < 0xFFFF0000) {
+            auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            PPC_STORE_U32(currentThreadAddr + 88, (uint32_t)now_ms);
+        }
+    }
+
+    std::this_thread::yield();
+    ctx.r3.u64 = 1;
+}
 
 // Custom HLE implementation for KeReleaseSpinLockFromRaisedIrql
 PPC_FUNC(__imp__KeReleaseSpinLockFromRaisedIrql) {
@@ -1517,7 +1742,11 @@ HLE_STUB_DEFAULT(VdPersistDisplay)
 
 HLE_STUB_DEFAULT(VdEnableDisableClockGating)
 
-HLE_STUB_DEFAULT(VdSwap)
+PPC_FUNC(__imp__VdSwap) {
+    uint32_t frontBuffer = ctx.r3.u32;
+    HLE_LOG("VdSwap: frontBuffer=0x" << std::hex << frontBuffer << std::dec);
+    ctx.r3.u64 = STATUS_SUCCESS;
+}
 
 HLE_STUB_DEFAULT(VdGetSystemCommandBuffer)
 
@@ -1569,6 +1798,30 @@ PPC_FUNC(__imp__VdIsHSIOTrainingSucceeded) {
 
 PPC_FUNC(__imp__VdGetCurrentDisplayInformation) {
     HLE_LOG("VdGetCurrentDisplayInformation");
+    uint32_t addr = ctx.r3.u32;
+    if (addr != 0) {
+        GuestDisplayInfo* di = reinterpret_cast<GuestDisplayInfo*>(base + addr);
+        std::memset(di, 0, sizeof(GuestDisplayInfo));
+
+        di->front_buffer_width = __builtin_bswap16(1280);
+        di->front_buffer_height = __builtin_bswap16(720);
+        di->scaler_source_rect_x2 = __builtin_bswap32(1280);
+        di->scaler_source_rect_y2 = __builtin_bswap32(720);
+        di->scaled_output_width = __builtin_bswap32(1280);
+        di->scaled_output_height = __builtin_bswap32(720);
+        di->vertical_filter_type = __builtin_bswap32(1);
+        di->horizontal_filter_type = __builtin_bswap32(1);
+
+        di->display_width = __builtin_bswap16(1280);
+        di->display_height = __builtin_bswap16(720);
+
+        float fps = 60.0f;
+        uint32_t fpsBits;
+        std::memcpy(&fpsBits, &fps, 4);
+        di->display_refresh_rate = __builtin_bswap32(fpsBits);
+
+        di->actual_display_width = __builtin_bswap16(1280);
+    }
     ctx.r3.u64 = 0;
 }
 
@@ -1578,17 +1831,63 @@ PPC_FUNC(__imp__VdQueryVideoFlags) {
 }
 
 PPC_FUNC(__imp__VdInitializeEngines) {
-    HLE_LOG("VdInitializeEngines");
+    std::cout << "\033[1;32m[Video] VdInitializeEngines called!\033[0m" << std::endl;
     ctx.r3.u64 = STATUS_SUCCESS;
 }
 
 PPC_FUNC(__imp__VdShutdownEngines) {
-    HLE_LOG("VdShutdownEngines");
+    std::cout << "\033[1;33m[Video] VdShutdownEngines called!\033[0m" << std::endl;
     ctx.r3.u64 = STATUS_SUCCESS;
 }
 
+static std::atomic<uint32_t> g_graphicsCallback{ 0 };
+static std::atomic<uint32_t> g_graphicsUserData{ 0 };
+static std::atomic<bool> g_vsyncRunning{ false };
+
 PPC_FUNC(__imp__VdSetGraphicsInterruptCallback) {
-    HLE_LOG("VdSetGraphicsInterruptCallback");
+    uint32_t callback = ctx.r3.u32;
+    uint32_t userData = ctx.r4.u32;
+    std::cout << "\033[1;32m[Video] VdSetGraphicsInterruptCallback: callback=0x" << std::hex << callback
+              << ", userData=0x" << userData << std::dec << "\033[0m" << std::endl;
+
+    g_graphicsCallback.store(callback);
+    g_graphicsUserData.store(userData);
+
+    if (callback != 0 && !g_vsyncRunning.exchange(true)) {
+        std::thread vsyncThread([base]() {
+            uint32_t stackAlloc = 0x60800000;
+            uint32_t stackTop = stackAlloc + 0x40000 - 256;
+            uint32_t kpcr = HLE::CreateKPCR(base, 0x5007, 2, stackAlloc, stackTop);
+
+            while (g_vsyncRunning.load(std::memory_order_relaxed)) {
+                std::this_thread::sleep_for(std::chrono::microseconds(16666)); // ~60 Hz VSync
+                uint32_t cbAddr = g_graphicsCallback.load(std::memory_order_relaxed);
+                uint32_t uData = g_graphicsUserData.load(std::memory_order_relaxed);
+
+                if (uData >= 0x10000 && uData < 0xFFFF0000) {
+                    uint32_t r11_ptr = PPC_LOAD_U32(uData + 10896);
+                    if (r11_ptr >= 0x10000 && r11_ptr < 0xFFFF0000) {
+                        uint32_t r10_wptr = PPC_LOAD_U32(uData + 10908);
+                        PPC_STORE_U32(r11_ptr + 0, r10_wptr);
+                        if (g_rptrWritebackAddr != 0) {
+                            PPC_STORE_U32(g_rptrWritebackAddr, r10_wptr);
+                        }
+                    }
+                }
+
+                if (cbAddr >= PPC_CODE_BASE && cbAddr < (PPC_CODE_BASE + PPC_CODE_SIZE)) {
+                    alignas(64) PPCContext cbCtx{};
+                    cbCtx.r1.u64 = stackTop;
+                    cbCtx.r13.u64 = kpcr;
+                    cbCtx.fpscr.setcsr(0x1F80);
+                    cbCtx.r3.u64 = 1; // VSync interrupt source = 1
+                    cbCtx.r4.u64 = uData;
+                    (PPC_LOOKUP_FUNC(base, cbAddr))(cbCtx, base);
+                }
+            }
+        });
+        vsyncThread.detach();
+    }
     ctx.r3.u64 = STATUS_SUCCESS;
 }
 
@@ -1755,4 +2054,68 @@ PPC_FUNC(sub_8215B288) {
         GuestWriteU32(base, structPtr + (index * 4), value);
     }
 }
+
+// Native override for weak sub_821F8970 (driver query dispatcher for FindFirstFile / FindNextFile)
+PPC_FUNC(sub_821F8970) {
+    uint32_t handle = ctx.r3.u32;
+    uint32_t buf = ctx.r4.u32;
+    uint32_t size = ctx.r5.u32;
+
+    NTSTATUS status = VFS::QueryDirectoryFile(base, handle, 0, 0, 0, 0, buf, size, 1, true, 0, false);
+    ctx.r3.s64 = static_cast<int32_t>(status);
+}
+
+// Native safe override for weak sub_824E5CB8 (intrusive list unlink and free)
+PPC_FUNC(sub_824E5CB8) {
+    uint32_t r10 = ctx.r3.u32;
+    uint32_t r4 = ctx.r4.u32;
+    uint32_t r5 = ctx.r5.u32;
+
+    if (r4 < 0x10000 || r4 >= 0xFFFF0000) {
+        return;
+    }
+
+    // stw r11, 16(r4) where r11 = 0
+    PPC_STORE_U32(r4 + 16, 0);
+
+    // List 1 traversal:
+    if (r10 >= 0x10000 && r10 < 0xFFFF0000) {
+        uint32_t p = r10;
+        uint32_t r11 = PPC_LOAD_U32(p);
+        int max_iters = 50000;
+        while (r11 != r4 && r11 >= 0x10000 && r11 < 0xFFFF0000 && --max_iters > 0) {
+            p = r11 + 4;
+            r11 = PPC_LOAD_U32(p);
+        }
+        if (r11 == r4) {
+            uint32_t next = PPC_LOAD_U32(r11 + 4);
+            PPC_STORE_U32(p, next);
+        }
+    }
+
+    // List 2 traversal:
+    uint32_t list2_obj = PPC_LOAD_U32(r4 + 12);
+    if (list2_obj >= 0x10000 && list2_obj < 0xFFFF0000) {
+        uint32_t p2 = list2_obj + 4;
+        uint32_t r11_2 = PPC_LOAD_U32(p2);
+        int max_iters2 = 50000;
+        while (r11_2 != r4 && r11_2 >= 0x10000 && r11_2 < 0xFFFF0000 && --max_iters2 > 0) {
+            p2 = r11_2 + 8;
+            r11_2 = PPC_LOAD_U32(p2);
+        }
+        if (r11_2 == r4) {
+            uint32_t next2 = PPC_LOAD_U32(r11_2 + 8);
+            PPC_STORE_U32(p2, next2);
+        }
+    }
+
+    // Free node via sub_824D21A0
+    ctx.r3.u64 = r5;
+    ctx.r4.u64 = r4;
+    ctx.r5.s64 = 20;
+    ctx.r6.s64 = 26;
+    (PPC_LOOKUP_FUNC(base, 0x824D21A0))(ctx, base);
+}
+
+
 

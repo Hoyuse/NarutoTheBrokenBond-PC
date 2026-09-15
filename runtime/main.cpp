@@ -10,6 +10,7 @@
 #include "ppc_recomp_shared.h"
 #include "memory_manager.h"
 #include "hle_stubs.h"
+#include "vfs.h"
 
 // Global context pointer for crash handler
 static PPCContext* g_activeContext = nullptr;
@@ -108,6 +109,10 @@ int main(int argc, char** argv) {
     HLE::Initialize();
     HLE::SetVerboseLogging(verboseHle);
 
+    std::string gameDir = std::filesystem::path(xexPath).parent_path().string();
+    if (gameDir.empty()) gameDir = "Naruto_The_Broken_Bond";
+    VFS::Initialize(gameDir);
+
     auto& mm = MemoryManager::Instance();
     if (!mm.Initialize()) {
         std::cerr << "[Runtime] Fatal: Failed to initialize memory manager." << std::endl;
@@ -128,8 +133,10 @@ int main(int argc, char** argv) {
     g_activeContext = &ctx;
     g_activeBase = base;
 
-    // Initialize Guest Stack Pointer (r1)
+    // Initialize Guest Stack Pointer (r1) and KPCR (r13)
     ctx.r1.u64 = mm.GetStackTop();
+    uint32_t mainKpcr = HLE::CreateKPCR(base, 0x1000, 0, mm.GetStackTop() - 0x100000, mm.GetStackTop());
+    ctx.r13.u64 = mainKpcr;
     ctx.fpscr.setcsr(0x1F80); // Default SSE MXCSR state (mask exceptions)
 
     std::cout << "\n\033[1;32m[Runtime] Starting execution at entry point _xstart (0x"
@@ -142,7 +149,26 @@ int main(int argc, char** argv) {
             if (!isRunning.load(std::memory_order_relaxed)) break;
             if (g_activeContext) {
                 std::cout << "\033[1;35m[Watchdog] Main Thread LR=0x" << std::hex << g_activeContext->lr
-                          << " SP=0x" << g_activeContext->r1.u32 << std::dec << "\033[0m" << std::endl;
+                          << " SP=0x" << g_activeContext->r1.u32
+                          << " r3=0x" << g_activeContext->r3.u32
+                          << " r4=0x" << g_activeContext->r4.u32
+                          << " r10=0x" << g_activeContext->r10.u32
+                          << " r11=0x" << g_activeContext->r11.u32
+                          << " r30=0x" << g_activeContext->r30.u32
+                          << " r31=0x" << g_activeContext->r31.u32
+                          << std::dec << "\033[0m" << std::endl;
+                static int dumpCount = 0;
+                if (++dumpCount <= 2 && g_activeBase) {
+                    uint32_t sp = g_activeContext->r1.u32;
+                    std::cout << "[Watchdog] Main Stack Scan (SP=0x" << std::hex << sp << "): ";
+                    for (uint32_t offset = 0; offset < 2048; offset += 4) {
+                        uint32_t val = GuestReadU32(g_activeBase, sp + offset);
+                        if (val >= 0x82000000 && val < 0x83000000) {
+                            std::cout << "0x" << std::hex << val << " ";
+                        }
+                    }
+                    std::cout << std::dec << std::endl;
+                }
             }
             HLE::DumpThreadStates();
         }

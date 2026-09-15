@@ -87,9 +87,24 @@ Al restar en aritmética sin signo de 64 bits, esto producía un desplazamiento 
 El juego depende de múltiples hilos auxiliares para decodificar video Bink, audio XMA y procesamiento en segundo plano:
 - Cada llamada a `ExCreateThread` reserva un segmento de pila guest de 64 KB independiente en memoria virtual y lanza un hilo nativo `std::thread`.
 - Cada hilo gestiona su propio `PPCContext` aislado y sincroniza su arranque con `NtResumeThread`.
+- Se inicializa el bloque de control del procesador **KPCR** (`r13`) y el objeto **KTHREAD** para cada hilo con su identificador único de CPU (`current_cpu`), límites de stack y contador de ticks.
 
-### 3. Bypass de Verificación de Integridad de Heap (`KeGetCurrentProcessType`)
-Las rutinas internas de administración de heap de Xbox verifican que el campo `ProcessType` (offset `+379` / `0x17B` de los bloques de heap) coincida estrictamente con el tipo de proceso retornado por `KeGetCurrentProcessType()`. El arnés garantiza que dicho byte se mantenga en `1` (`Title Process`), previniendo caídas del kernel de Xbox por `KeBugCheckEx(0xF4)`.
+### 3. Sistema de Archivos Virtual (VFS)
+El subsistema de archivos (`runtime/vfs.cpp`, `runtime/vfs.h`) proporciona:
+- Resolución de rutas agnóstica a mayúsculas/minúsculas (`CaseInsensitiveLookup`) entre la convención de discos Xbox (`GAME:\`, `D:\`, `\Device\Cdrom0\`) y el sistema de archivos host POSIX.
+- Implementación de `NtOpenFile`, `NtCreateFile`, `NtReadFile`, `NtReadFileScatter`, `NtQueryInformationFile`, `NtSetInformationFile` y `NtQueryDirectoryFile`.
+- Streaming transparente de paquetes de recursos como `naruto.bf`, bancos de sonido `.sra`, shaders `.sdb` y secuencias de video Bink (`.bik`).
+
+### 4. Sincronización del Procesador de Comandos GPU y Ring Buffer
+La arquitectura de video de Xbox 360 se comunica mediante un anillo de comandos DMA:
+- Implementación de `VdInitializeRingBuffer`, `VdEnableRingBufferRPtrWriteBack` y traducción de direcciones físicas (`MmGetPhysicalAddress`).
+- Un hilo de refresco a **60 Hz** sincroniza periódicamente los punteros de lectura de GPU (`rptr`), actualiza los flags de fence en el contexto del renderizador global (`0x820009C4`) y despacha interrupciones VSync hacia el callback del motor.
+- Override de seguridad para el watchdog de espera de GPU (`sub_821A1858`) y listas enlazadas intrusivas del motor Jade (`sub_824E5CB8`), evitando interbloqueos y bucles infinitos en el bucle principal.
+
+### 5. Arquitectura del Motor Jade (Ubisoft)
+*Naruto: The Broken Bond* fue desarrollado sobre una versión evolucionada del célebre **Jade Engine** de Ubisoft (utilizado también en *Beyond Good & Evil*, *Prince of Persia*, *King Kong* y *Rayman Raving Rabbids*):
+- **Estructura de Datos BigFile (`.bf`)**: Tabla de índices LZO/Zlib con hashes de 32/64 bits para carga en streaming de mundos (`.wow`), mallas y texturas.
+- **Render Thread Aislado (`sub_821610F0`)**: El hilo de renderizado opera de forma desacoplada del hilo de simulación lógica de entidades, sincronizándose mediante eventos NT (`0x833A3780` y `0x833A3784`) antes de invocar el intercambio de buffers (`sub_821B1DD0` / `VdSwap`).
 
 ---
 
