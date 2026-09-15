@@ -1,0 +1,32 @@
+# Build output
+build/
+bin/
+obj/
+*.o
+*.a
+*.so
+*.dylib
+*.pdb
+
+# Game assets & copyrighted binaries (Must be legally dumped from physical disc)
+Naruto_The_Broken_Bond/
+*.xex
+*.iso
+*.bf
+*.sdb
+*.wav
+*.xma
+
+# Submodule untracked / build outputs
+XenonRecomp/build/
+XenonRecomp/XenonAnalyse/main.cpp.bak
+
+# IDE & OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Temporary
+scratch/

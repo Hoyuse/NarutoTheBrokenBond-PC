@@ -1,0 +1,14 @@
+[main]
+file_path = "Naruto_The_Broken_Bond/default.xex"
+out_directory_path = "NarutoSource/"
+switch_table_file_path = "switch_tables.toml"
+
+# Direcciones exactas obtenidas de XenonAnalyse
+restgprlr_14_address = 0x82218A20
+savegprlr_14_address = 0x822189D0
+restfpr_14_address   = 0x8221AD2C
+savefpr_14_address   = 0x8221ACE0
+restvmx_14_address   = 0x823C4848
+savevmx_14_address   = 0x823C45B0
+restvmx_64_address   = 0x823C48DC
+savevmx_64_address   = 0x823C4644

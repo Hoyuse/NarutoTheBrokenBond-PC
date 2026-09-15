@@ -1,0 +1,3 @@
+[submodule "XenonRecomp"]
+	path = XenonRecomp
+	url = https://github.com/hedge-dev/XenonRecomp.git
