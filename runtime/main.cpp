@@ -170,6 +170,14 @@ int main(int argc, char** argv) {
                     std::cout << std::dec << std::endl;
                 }
             }
+            if (g_activeBase) {
+                uint32_t evRender = GuestReadU32(g_activeBase, 0x833A3780);
+                uint32_t evReady  = GuestReadU32(g_activeBase, 0x833A3784);
+                uint32_t flag14224 = GuestReadU32(g_activeBase, 0x833A3790);
+                std::cout << "\033[1;36m[Render State] evRender=0x" << std::hex << evRender 
+                          << ", evReady=0x" << evReady 
+                          << ", flag14224=" << std::dec << flag14224 << "\033[0m" << std::endl;
+            }
             HLE::DumpThreadStates();
         }
     });

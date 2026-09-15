@@ -97,6 +97,12 @@ NTSTATUS QueryDirectoryFile(
     bool restartScan
 );
 
+NTSTATUS QueryFullAttributesFile(
+    uint8_t* base,
+    uint32_t objAttrPtr,
+    uint32_t infoPtr
+);
+
 bool CloseFile(uint32_t handle);
 
 } // namespace VFS

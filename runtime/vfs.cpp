@@ -512,4 +512,36 @@ bool CloseFile(uint32_t handle) {
     return false;
 }
 
+NTSTATUS QueryFullAttributesFile(
+    uint8_t* base,
+    uint32_t objAttrPtr,
+    uint32_t infoPtr
+) {
+    std::string rawPath = ExtractGuestPath(base, objAttrPtr);
+    std::string hostPath = ResolvePath(rawPath);
+
+    struct stat st;
+    if (stat(hostPath.c_str(), &st) != 0) {
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+
+    std::cout << "\033[1;32m[VFS] QueryFullAttributesFile: FOUND \"" << rawPath << "\" -> \"" << hostPath 
+              << "\" (Size: " << st.st_size << " bytes)\033[0m" << std::endl;
+
+    if (infoPtr != 0) {
+        uint64_t winTime = (static_cast<uint64_t>(st.st_mtime) + 11644473600ULL) * 10000000ULL;
+        GuestWriteU64(base, infoPtr + 0, winTime);  // CreationTime
+        GuestWriteU64(base, infoPtr + 8, winTime);  // LastAccessTime
+        GuestWriteU64(base, infoPtr + 16, winTime); // LastWriteTime
+        GuestWriteU64(base, infoPtr + 24, winTime); // ChangeTime
+        GuestWriteU64(base, infoPtr + 32, static_cast<uint64_t>(st.st_size)); // AllocationSize
+        GuestWriteU64(base, infoPtr + 40, static_cast<uint64_t>(st.st_size)); // EndOfFile
+        uint32_t attr = S_ISDIR(st.st_mode) ? 0x00000010 : 0x00000020; // DIRECTORY / ARCHIVE
+        GuestWriteU32(base, infoPtr + 48, attr);    // FileAttributes
+    }
+
+    return STATUS_SUCCESS;
+}
+
 } // namespace VFS
+

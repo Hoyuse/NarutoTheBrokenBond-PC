@@ -451,7 +451,12 @@ PPC_FUNC(__imp___snprintf) {
     }
 }
 
-HLE_STUB_DEFAULT(NtQueryFullAttributesFile)
+// Custom HLE implementation for NtQueryFullAttributesFile
+PPC_FUNC(__imp__NtQueryFullAttributesFile) {
+    uint32_t objAttrPtr = ctx.r3.u32;
+    uint32_t infoPtr = ctx.r4.u32;
+    ctx.r3.u64 = VFS::QueryFullAttributesFile(base, objAttrPtr, infoPtr);
+}
 
 // Custom HLE implementation for XexCheckExecutablePrivilege
 PPC_FUNC(__imp__XexCheckExecutablePrivilege) {
